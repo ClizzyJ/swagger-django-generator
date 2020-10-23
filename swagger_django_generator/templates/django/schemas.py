@@ -15,6 +15,6 @@ __UNSPECIFIED__ = {}
 {% for name, definition in schemas|dictsort(true) %}
 {{ name }} = json.loads("""
 {{ definition }}
-""")
+""",strict=False)
 
 {% endfor %}

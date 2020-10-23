@@ -1,11 +1,16 @@
 import copy
 
-import click
-import jinja2
 import json
 import os
+import re
 import sys
+import parser
+
+import click
+import jinja2
+
 from swagger_parser import SwaggerParser
+
 
 DEFAULT_OUTPUT_DIR = "./generated"
 DEFAULT_MODULE = "generated"
@@ -80,7 +85,6 @@ _SWAGGER_FIELDS = frozenset(["name", "in", "required", "collectionFormat", "desc
 def clean_schema(schema):
     # type: (Dict) -> Dict
     """Transform a Swagger parameter definition to a valid JSONSchema
-
     Remove known Swagger fields as well as any custom definitions
     (starting with "x-").
     """
@@ -100,8 +104,15 @@ def parse_array(schema):
     # type: (Dict) -> string
     return '{name} = {name}.split("{separator}")'.format(
         name=schema["name"],
-        separator=SEPARATORS[schema.get("collectionFormat", ",")]
+        separator=SEPARATORS[schema.get("collectionFormat", "csv")]
     )
+
+
+def capitalize_splitter(value):
+    parts = re.findall('[A-Z][^A-Z]*', value)
+    parts_lower = [x.lower() for x in parts]
+
+    return '-'.join(parts_lower)
 
 
 def render_to_string(backend, filename, context):
@@ -128,6 +139,7 @@ def render_to_string(backend, filename, context):
     )
     environment.filters["clean_schema"] = clean_schema
     environment.filters["parse_array"] = parse_array
+    environment.filters["capitalize_splitter"] = capitalize_splitter
 
     return environment.get_template(filename).render(context)
 
@@ -236,6 +248,7 @@ class Generator(object):
         }
 
         self._make_class_definitions()
+        self._make_security_definitions()
 
     def resolve_schema_references(self, definition):
         # type: (Generator, Dict) -> None
@@ -243,7 +256,6 @@ class Generator(object):
         JSONSchema definitions may contain references.
         This function replaces all references with their full definitions.
         In-place mods are made.
-
         :param definition: A JSONSchema definition
         :return: The expended definition.
         """
@@ -256,6 +268,22 @@ class Generator(object):
         for value in definition.values():
             if isinstance(value, dict):
                 self.resolve_schema_references(value)
+
+    def _make_security_definitions(self):
+        """Process available security definition types:
+        * basic
+        * apiKey + JWT/Bearer option as a definition
+        - for now there's no support for OAuth2
+        - for now only 'in: header' is implemented
+        """
+        self.security_defs = {}
+        sec_defs = self.parser.specification.get("securityDefinitions", {})
+        for sec_desc, sec_type in sec_defs.items():
+            if sec_type['type'] in ['basic', 'apiKey']:
+                if sec_type.get('in') == 'header':
+                    sec_def = {'desc': sec_desc}
+                    sec_def.update(sec_type)
+                    self.security_defs[sec_type['type']] = sec_def
 
     def _make_class_definitions(self):
         self._classes = {}
@@ -280,10 +308,14 @@ class Generator(object):
                 # Add arguments
                 for name, detail in io["parameters"].items():
                     location = detail["in"]
+                    click.secho(location)
                     if location == "path":
                         section = "required_args" if detail["required"] else \
                             "optional_args"
                         payload[section].append(detail)
+                    elif location == "header":
+                        # continue;
+                        break
                     elif location == "query":
                         section = "required_args" if detail["required"] else \
                             "optional_args"
@@ -312,16 +344,19 @@ class Generator(object):
                             self.resolve_schema_references(schema)
                             payload["body"]["schema"] = \
                                 'json.loads("""{}""")'.format(
-                                    json.dumps(schema, indent=4, sort_keys=True)
+                                    json.dumps(schema, indent=4, sort_keys=True),
+                                    strict=False
                                 )
                     elif location == "formData":
                         payload["form_data"].append(detail)
                     else:
-                        msg = "Code generation for parameter type '{}' not " \
-                              "implemented yet. Operation '{}' parameter '{" \
-                              "}'".format(location, operation, name)
-                        click.secho(msg, fg="red")
+                        continue
+                        # msg = "Code generation for parameter type '{}' not " \
+                        #       "implemented yet. Operation '{}' parameter '{" \
+                        #       "}'".format(location, operation, name)
+                        # click.secho(msg, fg="red")
 
+                click.secho("test",fg="red")
                 # Added response
                 for name, detail in io["responses"].items():
                     if name == "default":
@@ -348,7 +383,7 @@ class Generator(object):
                             # reduce size of the generated code in views.py.
                             self.resolve_schema_references(schema)
                             payload["response_schema"] = \
-                                'json.loads("""{}""")'.format(
+                                'json.loads("""{}""",strict=False)'.format(
                                     json.dumps(schema, indent=4, sort_keys=True)
                                 )
 
@@ -414,9 +449,11 @@ class Generator(object):
         return render_to_string(
             self.backend, "views.py", {
                 "classes": self._classes,
+                'host': self.parser.specification.get('host'),
+                'basePath': self.parser.specification['basePath'],
                 "module": self.module_name,
                 "specification": json.dumps(self.parser.specification, indent=4,
-                                            sort_keys=True).replace("\\", "\\\\")
+                                            sort_keys=True).replace("\\", "\\\\"),
             })
 
     def generate_stubs(self):
@@ -437,7 +474,13 @@ class Generator(object):
         Generate a `utils.py` file from the given specification.
         :return: str
         """
-        return render_to_string(self.backend, "utils.py", {})
+        return render_to_string(
+            self.backend,
+            "utils.py",
+            {
+                "security_defs": self.security_defs
+            },
+        )
 
 @click.command()
 @click.argument("specification_path", type=click.Path(dir_okay=False, exists=True))
